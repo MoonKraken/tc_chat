@@ -1,13 +1,18 @@
+use std::sync::Arc;
+
 use topcoat::{
     Result,
     context::{Cx, app_context},
     router::page,
     runtime::{Event, connected, procedure, shard, signal},
-    view::{Unescaped, View, emit, live, view},
+    view::{Unescaped, View, component, emit, live, view},
 };
 use uuid::Uuid;
 
-use crate::{hub::ChatHub, markdown};
+use crate::{
+    hub::{ChatHub, ChatLine, Conversation},
+    markdown,
+};
 
 // Text nodes are HTML-escaped, and a browser does not decode entities inside
 // <script>. Keep this source free of `&`, `<`, and `>`.
@@ -153,12 +158,19 @@ pub async fn home(cx: &Cx) -> Result<impl View> {
 
 #[shard]
 async fn transcript(cx: &Cx, conversation: String) -> Result<impl View> {
+    // The outer region emits when a message is added. The nested region is
+    // only the reply still being written, so a token frame is that bubble.
     Ok(live! {
-        let hub = app_context::<ChatHub>(cx);
-        let mut changed = hub.open(&conversation).subscribe_updated();
+        let conversation = app_context::<ChatHub>(cx).open(&conversation);
+        let mut shape = conversation.subscribe_shape();
 
         loop {
-            let lines = hub.open(&conversation).lines();
+            let lines = conversation.lines();
+            let pending = lines
+                .iter()
+                .rev()
+                .find(|line| line.pending)
+                .map(|line| line.id);
             let token = emit! {
                 <div class="flex min-h-full flex-col gap-5 py-6">
                     if lines.is_empty() {
@@ -173,31 +185,12 @@ async fn transcript(cx: &Cx, conversation: String) -> Result<impl View> {
                     }
                     #[key(line.id)]
                     for line in lines {
-                        <article
-                            class=(if line.mine {
-                                "ml-auto max-w-[85%] rounded-2xl rounded-br-md bg-blue-500 px-4 py-3 text-white"
-                            } else {
-                                "mr-auto max-w-[85%] rounded-2xl rounded-bl-md bg-zinc-700 px-4 py-3 text-white"
-                            })
-                        >
-                            <p class="mb-1 text-[0.7rem] font-semibold uppercase tracking-wider opacity-70">
-                                (if line.mine { "You" } else { "Assistant" })
-                            </p>
-                            if line.pending && line.text.is_empty() {
-                                <p class="flex items-center gap-1 py-1" aria-label="The assistant is writing">
-                                    <span class="size-1.5 animate-bounce rounded-full bg-current [animation-delay:0ms]"></span>
-                                    <span class="size-1.5 animate-bounce rounded-full bg-current [animation-delay:150ms]"></span>
-                                    <span class="size-1.5 animate-bounce rounded-full bg-current [animation-delay:300ms]"></span>
-                                </p>
-                            } else {
-                                <div class="md">
-                                    (Unescaped::new_unchecked(markdown::render(&line.text)))
-                                </div>
-                                if line.pending {
-                                    <span class="mt-1 inline-block h-4 w-px animate-pulse bg-current align-middle"></span>
-                                }
-                            }
-                        </article>
+                        if !line.pending {
+                            bubble(line: line)
+                        }
+                    }
+                    if let Some(id) = pending {
+                        streaming_bubble(conversation: conversation.clone(), id: id)
                     }
                 </div>
             }?;
@@ -205,8 +198,57 @@ async fn transcript(cx: &Cx, conversation: String) -> Result<impl View> {
             if !connected(cx) {
                 break Ok(token);
             }
-            changed.recv().await.ok();
+            shape.recv().await.ok();
         }
+    })
+}
+
+#[component]
+async fn streaming_bubble(cx: &Cx, conversation: Arc<Conversation>, id: u64) -> Result<impl View> {
+    Ok(live! {
+        let mut ticks = conversation.subscribe_text();
+        loop {
+            let Some(line) = conversation.line(id) else {
+                break Ok(emit! { <span></span> }?);
+            };
+            let pending = line.pending;
+            let token = emit! { bubble(line: line) }?;
+            if !connected(cx) || !pending {
+                break Ok(token);
+            }
+            ticks.recv().await.ok();
+        }
+    })
+}
+
+#[component]
+async fn bubble(line: ChatLine) -> Result<impl View> {
+    Ok(view! {
+        <article
+            class=(if line.mine {
+                "ml-auto max-w-[85%] rounded-2xl rounded-br-md bg-blue-500 px-4 py-3 text-white"
+            } else {
+                "mr-auto max-w-[85%] rounded-2xl rounded-bl-md bg-zinc-700 px-4 py-3 text-white"
+            })
+        >
+            <p class="mb-1 text-[0.7rem] font-semibold uppercase tracking-wider opacity-70">
+                (if line.mine { "You" } else { "Assistant" })
+            </p>
+            if line.pending && line.text.is_empty() {
+                <p class="flex items-center gap-1 py-1" aria-label="The assistant is writing">
+                    <span class="size-1.5 animate-bounce rounded-full bg-current [animation-delay:0ms]"></span>
+                    <span class="size-1.5 animate-bounce rounded-full bg-current [animation-delay:150ms]"></span>
+                    <span class="size-1.5 animate-bounce rounded-full bg-current [animation-delay:300ms]"></span>
+                </p>
+            } else {
+                <div class="md">
+                    (Unescaped::new_unchecked(markdown::render(&line.text)))
+                </div>
+                if line.pending {
+                    <span class="mt-1 inline-block h-4 w-px animate-pulse bg-current align-middle"></span>
+                }
+            }
+        </article>
     })
 }
 

@@ -34,10 +34,15 @@ struct ConversationInner {
     generating: bool,
 }
 
-/// One browser conversation. Token appends notify `updated`.
+/// One browser conversation.
+///
+/// `shape` fires when a message is added. `text` fires when the reply that
+/// is still being written grows. The two stay separate so a token does not
+/// wake the transcript list.
 pub struct Conversation {
     inner: Mutex<ConversationInner>,
-    updated: broadcast::Sender<()>,
+    shape: broadcast::Sender<()>,
+    text: broadcast::Sender<()>,
 }
 
 #[derive(Clone)]
@@ -112,7 +117,7 @@ impl ChatHub {
         inner.truncate();
         let turns = inner.turns(&self.system_prompt);
         drop(inner);
-        conversation.notify_updated();
+        conversation.notify_shape();
 
         Ok(Prepared {
             conversation,
@@ -130,7 +135,8 @@ impl Conversation {
                 next_id: 1,
                 generating: false,
             }),
-            updated: broadcast::channel(64).0,
+            shape: broadcast::channel(64).0,
+            text: broadcast::channel(64).0,
         })
     }
 
@@ -140,21 +146,28 @@ impl Conversation {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub fn subscribe_updated(&self) -> broadcast::Receiver<()> {
-        self.updated.subscribe()
+    pub fn subscribe_shape(&self) -> broadcast::Receiver<()> {
+        self.shape.subscribe()
+    }
+
+    pub fn subscribe_text(&self) -> broadcast::Receiver<()> {
+        self.text.subscribe()
     }
 
     pub fn lines(&self) -> Vec<ChatLine> {
         self.lock()
             .messages
             .iter()
-            .map(|message| ChatLine {
-                id: message.id,
-                mine: message.author == Author::User,
-                text: message.text.clone(),
-                pending: message.pending,
-            })
+            .map(StoredMessage::to_line)
             .collect()
+    }
+
+    pub fn line(&self, id: u64) -> Option<ChatLine> {
+        self.lock()
+            .messages
+            .iter()
+            .find(|message| message.id == id)
+            .map(StoredMessage::to_line)
     }
 
     fn append(&self, id: u64, text: &str) -> bool {
@@ -199,8 +212,23 @@ impl Conversation {
         inner.generating = false;
     }
 
-    fn notify_updated(&self) {
-        let _ = self.updated.send(());
+    fn notify_shape(&self) {
+        let _ = self.shape.send(());
+    }
+
+    fn notify_text(&self) {
+        let _ = self.text.send(());
+    }
+}
+
+impl StoredMessage {
+    fn to_line(&self) -> ChatLine {
+        ChatLine {
+            id: self.id,
+            mine: self.author == Author::User,
+            text: self.text.clone(),
+            pending: self.pending,
+        }
     }
 }
 
@@ -278,7 +306,7 @@ async fn generate(
                             break;
                         }
                         if last_flush.elapsed() >= FLUSH_AFTER {
-                            conversation.notify_updated();
+                            conversation.notify_text();
                             last_flush = Instant::now();
                         }
                     }
@@ -297,7 +325,7 @@ async fn generate(
     }
 
     conversation.finish(assistant_id, fallback.as_deref());
-    conversation.notify_updated();
+    conversation.notify_text();
 }
 
 pub fn normalize_prompt(text: &str) -> Result<String, String> {
